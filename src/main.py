@@ -1,7 +1,7 @@
 import os
 import sqlite3
 import uuid
-from flask import Flask, render_template_string, request, redirect, url_for, session, abort, flash
+from flask import Flask, render_template_string, request, redirect, url_for, session, abort, flash, jsonify
 from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
@@ -80,6 +80,24 @@ def render_page(title, content_html, **kwargs):
             .btn-outline-primary:hover {{ background-color: #ff5722; color: #fff; }}
             .badge-cart {{ font-size: 0.75rem; vertical-align: top; }}
             .toast-container-custom {{ position: fixed; top: 20px; right: 20px; z-index: 1090; }}
+            html {{ scroll-behavior: smooth; }}
+
+            /* ปุ่มลอยสำหรับกลับขึ้นด้านบน */
+            #btnBackToTop {{
+                position: fixed;
+                bottom: 30px;
+                right: 30px;
+                display: none;
+                z-index: 1080;
+                width: 50px;
+                height: 50px;
+                border-radius: 50%;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.25);
+                transition: transform 0.2s, background-color 0.2s;
+            }}
+            #btnBackToTop:hover {{
+                transform: translateY(-4px);
+            }}
         </style>
     </head>
     <body>
@@ -129,9 +147,16 @@ def render_page(title, content_html, **kwargs):
         </div>
       </div>
     </nav>
+
     <div class="container py-4">
         {content_html}
     </div>
+
+    <!-- ปุ่มลอย Back to Top -->
+    <button type="button" class="btn btn-warning text-dark fw-bold d-flex align-items-center justify-content-center p-0" id="btnBackToTop" title="กลับขึ้นด้านบน">
+        <i class="bi bi-arrow-up fs-4"></i>
+    </button>
+
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
       setTimeout(function() {{
@@ -141,6 +166,20 @@ def render_page(title, content_html, **kwargs):
           bsAlert.close();
         }});
       }}, 3500);
+
+      // ควบคุมการแสดงผลของปุ่ม Back to Top
+      let mybutton = document.getElementById("btnBackToTop");
+      window.onscroll = function () {{
+          if (document.body.scrollTop > 250 || document.documentElement.scrollTop > 250) {{
+              mybutton.style.display = "flex";
+          }} else {{
+              mybutton.style.display = "none";
+          }}
+      }};
+
+      mybutton.addEventListener("click", function () {{
+          window.scrollTo({{ top: 0, behavior: 'smooth' }});
+      }});
     </script>
     </body>
     </html>
@@ -252,7 +291,7 @@ def index():
     """
     return render_page("หน้าร้านค้า", content, books=books, categories=categories, q=q, selected_cat=selected_cat)
 
-# 2. เพิ่มสินค้าลงตะกร้า (ยังคงแจ้งเตือนเมื่อเพิ่มสินค้าลงตะกร้า)
+# 2. เพิ่มสินค้าลงตะกร้า
 @app.route('/cart/add/<int:ebook_id>', methods=['POST'])
 def add_to_cart(ebook_id):
     conn = get_db()
@@ -418,7 +457,7 @@ def remove_cart_item(item_id):
     flash("🗑️ นำสินค้าออกจากตะกร้าแล้ว", "info")
     return redirect(url_for('view_cart'))
 
-# 4. หน้าชำระเงิน (ไม่มีแจ้งเตือน Pop-up เด้งเมื่อชำระเสร็จ)
+# 4. หน้าชำระเงิน
 @app.route('/checkout', methods=['GET', 'POST'])
 def checkout():
     conn = get_db()
@@ -472,7 +511,6 @@ def checkout():
         cur.execute("DELETE FROM cart_items WHERE cart_id = ?", (cart_id,))
         conn.commit()
 
-        # ไปยังหน้ารายการสั่งซื้อทันทีโดยไม่ต้องแสดงแจ้งเตือน
         return redirect(url_for('my_orders'))
         
     content = """
@@ -537,7 +575,8 @@ def checkout():
 def my_orders():
     conn = get_db()
     orders = conn.execute("""
-        SELECT o.order_id, o.status, o.total_amount, o.created_at,
+        SELECT o.order_id, o.status, o.total_amount,
+               datetime(o.created_at, '+7 hours') as created_at,
                p.payment_method, p.payment_status,
                COUNT(oi.order_item_id) as total_items
         FROM orders o
@@ -549,7 +588,8 @@ def my_orders():
     """, (session['user_id'],)).fetchall()
     
     downloads = conn.execute("""
-        SELECT o.order_id, e.ebook_id, e.title, e.cover_url, dl.download_token, o.created_at
+        SELECT o.order_id, e.ebook_id, e.title, e.cover_url, dl.download_token,
+               datetime(o.created_at, '+7 hours') as created_at
         FROM orders o
         JOIN order_items oi ON o.order_id = oi.order_id
         JOIN ebooks e ON oi.ebook_id = e.ebook_id
@@ -692,7 +732,7 @@ def download(token):
     </div>
     """
 
-# 7. แอดมิน Dashboard
+# 7. แอดมิน Dashboard (จัดการข้อมูล, บัญชีผู้ใช้, วิเคราะห์พฤติกรรมลูกค้า, ตรวจสอบยอดขายและคนซื้อรายเล่ม)
 @app.route('/admin')
 def admin_dashboard():
     if session.get('role') != 'admin':
@@ -700,11 +740,16 @@ def admin_dashboard():
     
     conn = get_db()
     
+    # ดึงรายการหนังสือ พร้อมคำนวณจำนวนเล่มที่ขายได้จริง (นับเฉพาะออเดอร์ confirmed)
     ebooks_list = conn.execute("""
-        SELECT e.*, c.name as category_name, a.name as author_name
+        SELECT e.*, c.name as category_name, a.name as author_name,
+               COUNT(CASE WHEN o.status = 'confirmed' THEN oi.order_item_id END) as total_sold
         FROM ebooks e
         JOIN categories c ON e.category_id = c.category_id
         JOIN authors a ON e.author_id = a.author_id
+        LEFT JOIN order_items oi ON e.ebook_id = oi.ebook_id
+        LEFT JOIN orders o ON oi.order_id = o.order_id
+        GROUP BY e.ebook_id
         ORDER BY e.ebook_id DESC
     """).fetchall()
 
@@ -717,8 +762,10 @@ def admin_dashboard():
     
     authors = conn.execute("SELECT * FROM authors").fetchall()
 
+    # ดึงรายการออเดอร์ พร้อมปรับเวลา created_at เป็นเวลาไทย (+7 hours)
     orders = conn.execute("""
-        SELECT o.order_id, u.full_name, u.email, o.total_amount, o.status, o.created_at,
+        SELECT o.order_id, u.full_name, u.email, o.total_amount, o.status,
+               datetime(o.created_at, '+7 hours') as created_at,
                p.payment_method, p.payment_status, p.proof_url
         FROM orders o
         JOIN users u ON o.user_id = u.user_id
@@ -726,11 +773,60 @@ def admin_dashboard():
         ORDER BY o.order_id DESC
     """).fetchall()
     
+    # ดึงข้อมูลบัญชีผู้ใช้ทั้งหมด พร้อมปรับเวลาสมัครเป็นเวลาไทย (+7 hours)[cite: 1]
+    all_users = conn.execute("""
+        SELECT u.user_id, u.email, u.full_name,
+               datetime(u.created_at, '+7 hours') as created_at,
+               r.role_id, r.role_name
+        FROM users u
+        JOIN roles r ON u.role_id = r.role_id
+        ORDER BY u.user_id ASC
+    """).fetchall()
+
+    total_users_count = len(all_users)
+    total_admins_count = sum(1 for u in all_users if u['role_name'] == 'admin')
+
+    # วิเคราะห์พฤติกรรมการซื้อของลูกค้าแต่ละคน (Behavior Analytics / RFM)
+    user_behaviors = conn.execute("""
+        SELECT 
+            u.user_id,
+            u.full_name,
+            u.email,
+            COUNT(DISTINCT CASE WHEN o.status = 'confirmed' THEN o.order_id END) AS completed_orders,
+            COALESCE(SUM(CASE WHEN o.status = 'confirmed' THEN o.total_amount ELSE 0 END), 0) AS total_spent,
+            MAX(CASE WHEN o.status = 'confirmed' THEN datetime(o.created_at, '+7 hours') END) AS last_purchase_date,
+            (
+                SELECT c.name
+                FROM order_items oi2
+                JOIN ebooks eb2 ON oi2.ebook_id = eb2.ebook_id
+                JOIN categories c ON eb2.category_id = c.category_id
+                JOIN orders o2 ON oi2.order_id = o2.order_id
+                WHERE o2.user_id = u.user_id AND o2.status = 'confirmed'
+                GROUP BY c.category_id
+                ORDER BY COUNT(oi2.order_item_id) DESC
+                LIMIT 1
+            ) AS favorite_category,
+            (
+                SELECT COUNT(ci.cart_item_id)
+                FROM carts cr
+                JOIN cart_items ci ON cr.cart_id = ci.cart_id
+                WHERE cr.user_id = u.user_id
+            ) AS pending_cart_items
+        FROM users u
+        LEFT JOIN orders o ON u.user_id = o.user_id
+        GROUP BY u.user_id
+        ORDER BY total_spent DESC, completed_orders DESC
+    """).fetchall()
+
+    active_buyers_count = sum(1 for ub in user_behaviors if ub['completed_orders'] > 0)
+    abandoned_carts_count = sum(1 for ub in user_behaviors if (ub['pending_cart_items'] or 0) > 0)
+
+    # 4 รายงานเชิงสถิติ (ตัดยอดรายวันตามเวลาไทย)[cite: 1]
     r1 = conn.execute("""
-        SELECT DATE(created_at) as sale_date, COUNT(order_id) as total_orders, 
+        SELECT DATE(datetime(created_at, '+7 hours')) as sale_date, COUNT(order_id) as total_orders, 
                SUM(total_amount) as total_sales, AVG(total_amount) as avg_sales
         FROM orders WHERE status = 'confirmed'
-        GROUP BY DATE(created_at) ORDER BY sale_date DESC LIMIT 5
+        GROUP BY DATE(datetime(created_at, '+7 hours')) ORDER BY sale_date DESC LIMIT 5
     """).fetchall()
 
     r2 = conn.execute("""
@@ -764,7 +860,19 @@ def admin_dashboard():
     content = """
     <div class="d-flex justify-content-between align-items-center mb-4">
         <h3 class="fw-bold m-0"><i class="bi bi-gear-fill text-warning"></i> ระบบจัดการร้านค้าหลังบ้าน (Admin)</h3>
-        <div class="d-flex gap-2">
+        <div class="d-flex flex-wrap gap-2">
+            <a href="#reportsSection" class="btn btn-outline-dark fw-bold rounded-pill px-3">
+                <i class="bi bi-bar-chart-line-fill text-primary"></i> 4 รายงานเชิงสถิติ
+            </a>
+            <a href="#booksSection" class="btn btn-outline-dark fw-bold rounded-pill px-3">
+                <i class="bi bi-book"></i> รายการหนังสือและยอดขาย
+            </a>
+            <a href="#behaviorSection" class="btn btn-outline-success fw-bold rounded-pill px-3">
+                <i class="bi bi-graph-up"></i> วิเคราะห์พฤติกรรมลูกค้า
+            </a>
+            <a href="#usersSection" class="btn btn-outline-info fw-bold rounded-pill px-3">
+                <i class="bi bi-people-fill"></i> จัดการบัญชีผู้ใช้
+            </a>
             <button class="btn btn-outline-primary fw-bold rounded-pill px-3" data-bs-toggle="modal" data-bs-target="#addCategoryModal">
                 <i class="bi bi-tag"></i> + เพิ่มหมวดหมู่ใหม่
             </button>
@@ -774,7 +882,273 @@ def admin_dashboard():
         </div>
     </div>
 
-    <!-- ส่วนจัดการหมวดหมู่สินค้า -->
+    <!-- ส่วนวิเคราะห์พฤติกรรมการซื้อของลูกค้า (Customer Behavior Insights) -->
+    <div class="card mb-4 border-0 shadow-sm rounded-3" id="behaviorSection">
+        <div class="card-header bg-primary text-white fw-bold py-2 d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-pie-chart-fill"></i> รายงานวิเคราะห์พฤติกรรมการซื้อของลูกค้า (Customer Buying Behavior)</span>
+            <span class="badge bg-light text-dark">
+                ลูกค้าที่เคยซื้อสำเร็จ {{ active_buyers_count }} คน | ตะกร้าค้างชำระ {{ abandoned_carts_count }} คน
+            </span>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light small">
+                        <tr>
+                            <th>ลูกค้า</th>
+                            <th class="text-center">สั่งซื้อสำเร็จ</th>
+                            <th class="text-end">ยอดซื้อรวม (บาท)</th>
+                            <th class="text-center">ซื้อล่าสุดเมื่อ</th>
+                            <th>แนวหนังสือที่ชอบ</th>
+                            <th class="text-center">ของที่ค้างในตะกร้า</th>
+                            <th class="text-center">กลุ่มพฤติกรรม (Segment)</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ub in user_behaviors %}
+                        <tr>
+                            <td>
+                                <div class="fw-bold">{{ ub['full_name'] }}</div>
+                                <small class="text-muted">{{ ub['email'] }}</small>
+                            </td>
+                            <td class="text-center">
+                                <span class="badge bg-light text-dark border">{{ ub['completed_orders'] }} ครั้ง</span>
+                            </td>
+                            <td class="text-end fw-bold text-success">
+                                ฿{{ "{:,.2f}".format(ub['total_spent']) }}
+                            </td>
+                            <td class="text-center small text-muted">
+                                {{ ub['last_purchase_date'] or 'ยังไม่เคยซื้อ' }}
+                            </td>
+                            <td>
+                                {% if ub['favorite_category'] %}
+                                    <span class="badge bg-info text-dark"><i class="bi bi-book-half"></i> {{ ub['favorite_category'] }}</span>
+                                {% else %}
+                                    <span class="text-muted small">-</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-center">
+                                {% if (ub['pending_cart_items'] or 0) > 0 %}
+                                    <button type="button" class="btn btn-sm btn-warning text-dark fw-bold rounded-pill px-2 py-1 shadow-sm"
+                                            onclick="viewUserCart('{{ ub['user_id'] }}', '{{ ub['full_name'] }}')"
+                                            title="คลิกเพื่อดูหนังสือที่ค้างในตะกร้า">
+                                        <i class="bi bi-cart3"></i> ค้าง {{ ub['pending_cart_items'] }} เล่ม (ดูของ)
+                                    </button>
+                                {% else %}
+                                    <span class="text-muted small">-</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-center">
+                                {% if ub['total_spent'] >= 1000 %}
+                                    <span class="badge bg-danger"><i class="bi bi-trophy-fill"></i> VIP Spender</span>
+                                {% elif ub['completed_orders'] >= 2 %}
+                                    <span class="badge bg-success"><i class="bi bi-star-fill"></i> ลูกค้าประจำ</span>
+                                {% elif ub['completed_orders'] == 1 %}
+                                    <span class="badge bg-primary">ลูกค้าใหม่</span>
+                                {% elif (ub['pending_cart_items'] or 0) > 0 %}
+                                    <span class="badge bg-warning text-dark">ลังเล (มีของในตะกร้า)</span>
+                                {% else %}
+                                    <span class="badge bg-secondary">ผู้เยี่ยมชม</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal แสดงรายการหนังสือที่ค้างในตะกร้าของลูกค้า -->
+    <div class="modal fade" id="userCartModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold" id="userCartModalTitle">🛒 รายการหนังสือที่ค้างในตะกร้า</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div id="userCartLoading" class="text-center py-4">
+                        <div class="spinner-border text-warning" role="status"></div>
+                        <p class="text-muted mt-2 mb-0">กำลังโหลดรายการในตะกร้า...</p>
+                    </div>
+                    <div id="userCartContent" class="d-none">
+                        <div class="table-responsive">
+                            <table class="table table-hover align-middle mb-0">
+                                <thead class="table-light small">
+                                    <tr>
+                                        <th class="ps-3">รูปปก</th>
+                                        <th>ชื่อหนังสือ</th>
+                                        <th>หมวดหมู่</th>
+                                        <th class="text-center">จำนวนในตะกร้า</th>
+                                        <th class="text-end pe-3">ราคา/เล่ม</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="userCartTableBody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div id="userCartEmpty" class="text-center py-4 d-none text-muted">
+                        <i class="bi bi-cart-x fs-2 d-block"></i>
+                        ไม่มีสินค้าค้างในตะกร้าแล้ว
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">ปิด</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function viewUserCart(userId, userName) {
+        document.getElementById('userCartModalTitle').innerText = '🛒 สินค้าในตะกร้าของคุณ ' + userName;
+        document.getElementById('userCartLoading').classList.remove('d-none');
+        document.getElementById('userCartContent').classList.add('d-none');
+        document.getElementById('userCartEmpty').classList.add('d-none');
+
+        var modal = new bootstrap.Modal(document.getElementById('userCartModal'));
+        modal.show();
+
+        fetch('/admin/user/' + userId + '/cart')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('userCartLoading').classList.add('d-none');
+                if (data.items && data.items.length > 0) {
+                    var rowsHtml = '';
+                    data.items.forEach(it => {
+                        rowsHtml += `
+                            <tr>
+                                <td class="ps-3">
+                                    <img src="${it.cover_url || 'https://placehold.co/40x55'}" style="width: 40px; height: 55px; object-fit: cover;" class="rounded">
+                                </td>
+                                <td><div class="fw-bold">${it.title}</div></td>
+                                <td><span class="badge bg-light text-dark border">${it.category_name}</span></td>
+                                <td class="text-center fw-bold"><span class="badge bg-warning text-dark">${it.quantity} เล่ม</span></td>
+                                <td class="text-end pe-3 fw-bold text-danger">฿${parseFloat(it.price).toLocaleString('th-TH', {minimumFractionDigits: 2})}</td>
+                            </tr>
+                        `;
+                    });
+                    document.getElementById('userCartTableBody').innerHTML = rowsHtml;
+                    document.getElementById('userCartContent').classList.remove('d-none');
+                } else {
+                    document.getElementById('userCartEmpty').classList.remove('d-none');
+                }
+            })
+            .catch(err => {
+                document.getElementById('userCartLoading').classList.add('d-none');
+                alert('เกิดข้อผิดพลาดในการโหลดข้อมูลตะกร้า');
+            });
+    }
+    </script>
+
+    <!-- ส่วนจัดการบัญชีผู้ใช้และมอบสิทธิ์ Admin[cite: 1] -->
+    <div class="card mb-4 border-0 shadow-sm rounded-3" id="usersSection">
+        <div class="card-header bg-dark text-white fw-bold py-2 d-flex justify-content-between align-items-center">
+            <span>👥 จัดการบัญชีผู้ใช้ทั้งหมด ({{ total_users_count }} บัญชี)</span>
+            <span class="badge bg-warning text-dark">แอดมิน {{ total_admins_count }} คน / สมาชิกทั่วไป {{ total_users_count - total_admins_count }} คน</span>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                    <thead class="table-light small">
+                        <tr>
+                            <th style="width: 70px;">ID</th>
+                            <th>ชื่อ-นามสกุล</th>
+                            <th>อีเมล</th>
+                            <th>วันที่สมัคร (เวลาไทย)</th>
+                            <th>ระดับสิทธิ์</th>
+                            <th class="text-center" style="width: 200px;">จัดการสิทธิ์</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for u in all_users %}
+                        <tr>
+                            <td class="fw-bold">#{{ u['user_id'] }}</td>
+                            <td>{{ u['full_name'] }}</td>
+                            <td>{{ u['email'] }}</td>
+                            <td class="small text-muted">{{ u['created_at'] }}</td>
+                            <td>
+                                {% if u['role_name'] == 'admin' %}
+                                    <span class="badge bg-danger"><i class="bi bi-shield-lock-fill"></i> Admin</span>
+                                {% else %}
+                                    <span class="badge bg-secondary"><i class="bi bi-person"></i> Customer</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-center">
+                                {% if u['role_name'] == 'admin' %}
+                                    <button class="btn btn-sm btn-outline-danger rounded-pill px-3" 
+                                            onclick="openRoleModal('{{ u['user_id'] }}', '{{ u['full_name'] }}', 'customer', 'ปลดสิทธิ์ Admin')">
+                                        <i class="bi bi-person-dash"></i> ปลดสิทธิ์ Admin
+                                    </button>
+                                {% else %}
+                                    <button class="btn btn-sm btn-outline-success rounded-pill px-3" 
+                                            onclick="openRoleModal('{{ u['user_id'] }}', '{{ u['full_name'] }}', 'admin', 'แต่งตั้งเป็น Admin')">
+                                        <i class="bi bi-shield-plus"></i> ตั้งเป็น Admin
+                                    </button>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <!-- Modal ยืนยันรหัสผ่านเพื่อเปลี่ยนสิทธิ์ผู้ใช้[cite: 1] -->
+    <div class="modal fade" id="changeRoleModal" tabindex="-1">
+        <div class="modal-dialog">
+            <div class="modal-content">
+                <form action="/admin/user/change-role" method="POST">
+                    <div class="modal-header bg-dark text-white">
+                        <h6 class="modal-title fw-bold" id="roleModalTitle">ยืนยันการเปลี่ยนสิทธิ์</h6>
+                        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                    </div>
+                    <div class="modal-body">
+                        <p id="roleModalDesc" class="mb-3"></p>
+                        <input type="hidden" name="target_user_id" id="targetUserId">
+                        <input type="hidden" name="new_role_name" id="newRoleName">
+                        
+                        <div class="alert alert-warning small py-2 mb-3">
+                            <i class="bi bi-shield-lock"></i> ต้องยืนยันรหัสผ่านของบัญชีแอดมินที่กำลังใช้งานอยู่ก่อนดำเนินการ
+                        </div>
+
+                        <div class="mb-2">
+                            <label class="form-label fw-bold">รหัสผ่านของคุณ (Admin):</label>
+                            <input type="password" class="form-control" name="admin_password" placeholder="กรอกรหัสผ่านเพื่อยืนยัน" required>
+                        </div>
+                    </div>
+                    <div class="modal-footer">
+                        <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">ยกเลิก</button>
+                        <button type="submit" class="btn btn-primary btn-sm fw-bold px-3" id="roleModalSubmitBtn">ยืนยัน</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function openRoleModal(userId, userName, targetRole, actionText) {
+        document.getElementById('targetUserId').value = userId;
+        document.getElementById('newRoleName').value = targetRole;
+        document.getElementById('roleModalTitle').innerText = actionText;
+        document.getElementById('roleModalDesc').innerHTML = 'คุณกำลังจะทำการ <strong>' + actionText + '</strong> ให้กับคุณ <strong>' + userName + '</strong>';
+        
+        var submitBtn = document.getElementById('roleModalSubmitBtn');
+        if (targetRole === 'admin') {
+            submitBtn.className = 'btn btn-success btn-sm fw-bold px-3';
+        } else {
+            submitBtn.className = 'btn btn-danger btn-sm fw-bold px-3';
+        }
+        
+        var myModal = new bootstrap.Modal(document.getElementById('changeRoleModal'));
+        myModal.show();
+    }
+    </script>
+
+    <!-- ส่วนจัดการหมวดหมู่สินค้า[cite: 1] -->
     <div class="card mb-4 border-0 shadow-sm rounded-3">
         <div class="card-header bg-secondary text-white fw-bold py-2 d-flex justify-content-between align-items-center">
             <span>🏷️ หมวดหมู่หนังสือทั้งหมด ({{ categories|length }} หมวด)</span>
@@ -797,7 +1171,7 @@ def admin_dashboard():
         </div>
     </div>
 
-    <!-- Modal เพิ่มหมวดหมู่ใหม่ -->
+    <!-- Modal เพิ่มหมวดหมู่ใหม่[cite: 1] -->
     <div class="modal fade" id="addCategoryModal" tabindex="-1">
         <div class="modal-dialog modal-sm">
             <div class="modal-content">
@@ -819,10 +1193,10 @@ def admin_dashboard():
         </div>
     </div>
 
-    <!-- จัดการรายการหนังสือ -->
-    <div class="card mb-4 border-0 shadow-sm rounded-3">
+    <!-- จัดการรายการหนังสือ + แสดงยอดขายจริง + ปุ่มดูรายชื่อคนซื้อ -->
+    <div class="card mb-4 border-0 shadow-sm rounded-3" id="booksSection">
         <div class="card-header bg-dark text-white fw-bold py-3 d-flex justify-content-between align-items-center">
-            <span>📚 จัดการรายการหนังสือทั้งหมดในระบบ (ปรับราคา / สต็อก / ลบ)</span>
+            <span>📚 จัดการรายการหนังสือและยอดขายจริง (ปรับราคา / สต็อก / ตรวจสอบคนซื้อ)</span>
             <span class="badge bg-secondary">ทั้งหมด {{ ebooks_list|length }} เล่ม</span>
         </div>
         <div class="card-body p-0">
@@ -834,9 +1208,10 @@ def admin_dashboard():
                             <th>ชื่อหนังสือ</th>
                             <th>หมวดหมู่</th>
                             <th>ผู้แต่ง</th>
-                            <th style="width: 140px;">ราคา (บาท)</th>
-                            <th style="width: 130px;">คงเหลือ (เล่ม)</th>
-                            <th class="text-center" style="width: 160px;">จัดการ</th>
+                            <th style="width: 130px;">ราคา (บาท)</th>
+                            <th style="width: 140px;" class="text-center">ขายได้แล้ว</th>
+                            <th style="width: 120px;">คงเหลือ</th>
+                            <th class="text-center" style="width: 220px;">จัดการ</th>
                         </tr>
                     </thead>
                     <tbody>
@@ -856,17 +1231,28 @@ def admin_dashboard():
                             <td>
                                 <input type="number" step="0.01" class="form-control form-control-sm" name="price" value="{{ b['price'] }}" required>
                             </td>
+                            <td class="text-center">
+                                <span class="badge bg-success-subtle text-success border border-success fw-bold px-2 py-1 fs-6">
+                                    {{ b['total_sold'] or 0 }} เล่ม
+                                </span>
+                            </td>
                             <td>
                                 <input type="number" class="form-control form-control-sm {% if (b['stock_quantity'] or 0) <= 0 %}border-danger bg-danger-subtle{% endif %}" name="stock_quantity" value="{{ b['stock_quantity'] or 0 }}" required>
                             </td>
                             <td class="text-center">
-                                <button type="submit" class="btn btn-sm btn-primary rounded-pill px-2" title="บันทึกราคาและสต็อก">
-                                    <i class="bi bi-save"></i> บันทึก
-                                </button>
+                                <div class="d-flex justify-content-center gap-1">
+                                    <button type="button" class="btn btn-sm btn-outline-info rounded-pill px-2" 
+                                            onclick="viewBookBuyers('{{ b['ebook_id'] }}', '{{ b['title'] }}')" title="ดูว่าใครซื้อหนังสือเล่มนี้บ้าง">
+                                        <i class="bi bi-people-fill"></i> ดูคนซื้อ
+                                    </button>
+                                    <button type="submit" class="btn btn-sm btn-primary rounded-pill px-2" title="บันทึกราคาและสต็อก">
+                                        <i class="bi bi-save"></i>
+                                    </button>
                         </form>
-                                <a href="/admin/book/delete/{{ b['ebook_id'] }}" class="btn btn-sm btn-outline-danger rounded-pill px-2" onclick="return confirm('ยืนยันลบหนังสือเล่มนี้?')" title="ลบหนังสือ">
-                                    <i class="bi bi-trash"></i>
-                                </a>
+                                    <a href="/admin/book/delete/{{ b['ebook_id'] }}" class="btn btn-sm btn-outline-danger rounded-pill px-2" onclick="return confirm('ยืนยันลบหนังสือเล่มนี้?')" title="ลบหนังสือ">
+                                        <i class="bi bi-trash"></i>
+                                    </a>
+                                </div>
                             </td>
                     </tr>
                     {% endfor %}
@@ -876,7 +1262,89 @@ def admin_dashboard():
         </div>
     </div>
 
-    <!-- Modal เพิ่มหนังสือใหม่ -->
+    <!-- Modal แสดงรายชื่อลูกค้าที่ซื้อหนังสือเล่มนั้นๆ -->
+    <div class="modal fade" id="bookBuyersModal" tabindex="-1">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content">
+                <div class="modal-header bg-dark text-white">
+                    <h5 class="modal-title fw-bold" id="buyersModalTitle">👥 รายชื่อผู้ซื้อหนังสือ</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body p-0">
+                    <div id="buyersLoading" class="text-center py-4">
+                        <div class="spinner-border text-primary" role="status"></div>
+                        <p class="text-muted mt-2 mb-0">กำลังโหลดรายชื่อผู้ซื้อ...</p>
+                    </div>
+                    <div id="buyersContent" class="d-none">
+                        <div class="table-responsive">
+                            <table class="table table-hover align-middle mb-0">
+                                <thead class="table-light small">
+                                    <tr>
+                                        <th>เลขออเดอร์</th>
+                                        <th>ชื่อลูกค้า</th>
+                                        <th>อีเมล</th>
+                                        <th>วันที่ซื้อ (เวลาไทย)</th>
+                                        <th>ราคาตอนซื้อ</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="buyersTableBody">
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                    <div id="buyersEmpty" class="text-center py-4 d-none text-muted">
+                        <i class="bi bi-inbox fs-2 d-block"></i>
+                        ยังไม่มีลูกค้าสั่งซื้อหนังสือเล่มนี้สำเร็จ
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">ปิด</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+    function viewBookBuyers(ebookId, title) {
+        document.getElementById('buyersModalTitle').innerText = '👥 ผู้ซื้อหนังสือ: ' + title;
+        document.getElementById('buyersLoading').classList.remove('d-none');
+        document.getElementById('buyersContent').classList.add('d-none');
+        document.getElementById('buyersEmpty').classList.add('d-none');
+        
+        var modal = new bootstrap.Modal(document.getElementById('bookBuyersModal'));
+        modal.show();
+
+        fetch('/admin/book/' + ebookId + '/buyers')
+            .then(res => res.json())
+            .then(data => {
+                document.getElementById('buyersLoading').classList.add('d-none');
+                if (data.buyers && data.buyers.length > 0) {
+                    var rowsHtml = '';
+                    data.buyers.forEach(b => {
+                        rowsHtml += `
+                            <tr>
+                                <td class="fw-bold text-primary">#${b.order_id}</td>
+                                <td class="fw-bold">${b.full_name}</td>
+                                <td class="text-muted">${b.email}</td>
+                                <td class="small">${b.created_at}</td>
+                                <td class="fw-bold text-success">฿${parseFloat(b.price).toLocaleString('th-TH', {minimumFractionDigits: 2})}</td>
+                            </tr>
+                        `;
+                    });
+                    document.getElementById('buyersTableBody').innerHTML = rowsHtml;
+                    document.getElementById('buyersContent').classList.remove('d-none');
+                } else {
+                    document.getElementById('buyersEmpty').classList.remove('d-none');
+                }
+            })
+            .catch(err => {
+                document.getElementById('buyersLoading').classList.add('d-none');
+                alert('เกิดข้อผิดพลาดในการโหลดข้อมูลผู้ซื้อ');
+            });
+    }
+    </script>
+
+    <!-- Modal เพิ่มหนังสือใหม่[cite: 1] -->
     <div class="modal fade" id="addBookModal" tabindex="-1">
         <div class="modal-dialog">
             <div class="modal-content">
@@ -956,7 +1424,7 @@ def admin_dashboard():
     }
     </script>
 
-    <!-- ตารางคำสั่งซื้อ + ปุ่มดูสลิปโอนเงินจำลอง -->
+    <!-- ตารางคำสั่งซื้อ + ปุ่มดูสลิปโอนเงินจำลอง[cite: 1] -->
     <div class="card mb-4 border-0 shadow-sm rounded-3">
         <div class="card-header bg-dark text-white fw-bold py-3 d-flex justify-content-between align-items-center">
             <span>รายการคำสั่งซื้อทั้งหมด (เรียงจากใหม่สุด)</span>
@@ -968,7 +1436,7 @@ def admin_dashboard():
                     <thead class="table-light small">
                         <tr>
                             <th>เลขออเดอร์</th>
-                            <th>วัน-เวลา</th>
+                            <th>วัน-เวลา (เวลาไทย)</th>
                             <th>ลูกค้า</th>
                             <th>ยอดชำระ</th>
                             <th>การชำระเงิน</th>
@@ -1032,8 +1500,10 @@ def admin_dashboard():
         </div>
     </div>
 
-    <!-- 4 รายงานวิเคราะห์ตามเกณฑ์ -->
-    <h4 class="fw-bold mb-3"><i class="bi bi-graph-up-arrow text-primary"></i> รายงานวิเคราะห์จากฐานข้อมูล (4 รายงาน)</h4>
+    <!-- 4 รายงานวิเคราะห์ตามเกณฑ์ พร้อม Anchor ID สำหรับปุ่มเลื่อนหน้าจอ -->
+    <div id="reportsSection" class="pt-2">
+        <h4 class="fw-bold mb-3"><i class="bi bi-graph-up-arrow text-primary"></i> รายงานวิเคราะห์จากฐานข้อมูล (4 รายงาน)</h4>
+    </div>
     <div class="row g-3">
         <div class="col-md-6">
             <div class="card h-100 shadow-sm border-0">
@@ -1081,9 +1551,113 @@ def admin_dashboard():
         </div>
     </div>
     """
-    return render_page("Admin Dashboard", content, ebooks_list=ebooks_list, categories=categories, authors=authors, orders=orders, r1=r1, r2=r2, r3=r3, r4=r4)
+    return render_page("Admin Dashboard", content, 
+                       ebooks_list=ebooks_list, categories=categories, authors=authors, orders=orders, 
+                       all_users=all_users, total_users_count=total_users_count, total_admins_count=total_admins_count, 
+                       user_behaviors=user_behaviors, active_buyers_count=active_buyers_count, abandoned_carts_count=abandoned_carts_count,
+                       r1=r1, r2=r2, r3=r3, r4=r4)
 
-# เพิ่มหมวดหมู่ใหม่ (Admin)
+
+# Route ดึงข้อมูลสินค้าที่ค้างอยู่ในตะกร้าของลูกค้าแต่ละคน (ส่งกลับเป็น JSON สำหรับ Modal)
+@app.route('/admin/user/<int:user_id>/cart')
+def get_user_cart(user_id):
+    if session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    conn = get_db()
+    items = conn.execute("""
+        SELECT ci.quantity, e.ebook_id, e.title, e.price, e.cover_url, c.name as category_name
+        FROM carts cr
+        JOIN cart_items ci ON cr.cart_id = ci.cart_id
+        JOIN ebooks e ON ci.ebook_id = e.ebook_id
+        JOIN categories c ON e.category_id = c.category_id
+        WHERE cr.user_id = ?
+    """, (user_id,)).fetchall()
+
+    result = []
+    for it in items:
+        result.append({
+            'ebook_id': it['ebook_id'],
+            'title': it['title'],
+            'price': it['price'],
+            'quantity': it['quantity'],
+            'cover_url': it['cover_url'],
+            'category_name': it['category_name']
+        })
+
+    return jsonify({'items': result})
+
+
+# Route ดึงประวัติผู้ซื้อของหนังสือเล่มใดเล่มหนึ่ง (ปรับเวลา created_at เป็นเวลาไทย +7 hours)
+@app.route('/admin/book/<int:ebook_id>/buyers')
+def get_book_buyers(ebook_id):
+    if session.get('role') != 'admin':
+        return jsonify({'error': 'Unauthorized'}), 403
+
+    conn = get_db()
+    buyers = conn.execute("""
+        SELECT u.user_id, u.full_name, u.email, o.order_id, oi.price,
+               datetime(o.created_at, '+7 hours') as created_at
+        FROM order_items oi
+        JOIN orders o ON oi.order_id = o.order_id
+        JOIN users u ON o.user_id = u.user_id
+        WHERE oi.ebook_id = ? AND o.status = 'confirmed'
+        ORDER BY o.order_id DESC
+    """, (ebook_id,)).fetchall()
+
+    result = []
+    for b in buyers:
+        result.append({
+            'user_id': b['user_id'],
+            'full_name': b['full_name'],
+            'email': b['email'],
+            'order_id': b['order_id'],
+            'price': b['price'],
+            'created_at': b['created_at']
+        })
+
+    return jsonify({'buyers': result})
+
+
+# Route สำหรับเปลี่ยนสิทธิ์ผู้ใช้ พร้อมระบบตรวจสอบรหัสผ่าน Admin[cite: 1]
+@app.route('/admin/user/change-role', methods=['POST'])
+def admin_change_user_role():
+    if session.get('role') != 'admin':
+        return "<h3>เฉพาะผู้ดูแลระบบ (Admin) เท่านั้น</h3>", 403
+
+    target_user_id = request.form.get('target_user_id')
+    new_role_name = request.form.get('new_role_name')
+    admin_password = request.form.get('admin_password')
+    current_admin_id = session.get('user_id')
+
+    conn = get_db()
+
+    # 1. ตรวจสอบรหัสผ่านของแอดมินปัจจุบันก่อน[cite: 1]
+    admin_user = conn.execute("SELECT * FROM users WHERE user_id = ?", (current_admin_id,)).fetchone()
+    if not admin_user or (admin_user['password_hash'] != admin_password and admin_user.get('password') != admin_password):
+        flash('รหัสผ่านแอดมินไม่ถูกต้อง ไม่สามารถเปลี่ยนสิทธิ์ได้!', 'danger')
+        return redirect('/admin')
+
+    # 2. ป้องกันไม่ให้แอดมินปลดสิทธิ์ตัวเอง[cite: 1]
+    if str(target_user_id) == str(current_admin_id) and new_role_name != 'admin':
+        flash('ไม่สามารถปลดสิทธิ์แอดมินของบัญชีตัวเองได้!', 'warning')
+        return redirect('/admin')
+
+    # 3. ค้นหา role_id จากชื่อ role[cite: 1]
+    role_row = conn.execute("SELECT role_id FROM roles WHERE role_name = ?", (new_role_name,)).fetchone()
+    if not role_row:
+        target_role_id = 1 if new_role_name == 'admin' else 2
+    else:
+        target_role_id = role_row['role_id']
+
+    # 4. บันทึกสิทธิ์ใหม่[cite: 1]
+    conn.execute("UPDATE users SET role_id = ? WHERE user_id = ?", (target_role_id, target_user_id))
+    conn.commit()
+
+    flash('ปรับเปลี่ยนระดับสิทธิ์เรียบร้อยแล้ว!', 'success')
+    return redirect('/admin')
+
+# เพิ่มหมวดหมู่ใหม่ (Admin)[cite: 1]
 @app.route('/admin/category/add', methods=['POST'])
 def add_category():
     if session.get('role') != 'admin':
@@ -1094,12 +1668,12 @@ def add_category():
         try:
             conn.execute("INSERT INTO categories (name) VALUES (?)", (category_name,))
             conn.commit()
-            flash(f"🏷️ เพิ่มหมวดหมู่ \"{category_name}\" สำเร็จ!", "success")
+            flash(f"🏷 เพิ่มหมวดหมู่ \"{category_name}\" สำเร็จ!", "success")
         except sqlite3.IntegrityError:
             flash(f"❌ หมวดหมู่ \"{category_name}\" มีอยู่แล้วในระบบ", "danger")
     return redirect(url_for('admin_dashboard'))
 
-# ลบหมวดหมู่ที่ไม่มีหนังสือ (Admin)
+# ลบหมวดหมู่ที่ไม่มีหนังสือ (Admin)[cite: 1]
 @app.route('/admin/category/delete/<int:cat_id>')
 def delete_category(cat_id):
     if session.get('role') != 'admin':
@@ -1110,7 +1684,7 @@ def delete_category(cat_id):
     flash("🗑️ ลบหมวดหมู่เรียบร้อยแล้ว", "info")
     return redirect(url_for('admin_dashboard'))
 
-# เพิ่มหนังสือใหม่ (Admin)
+# เพิ่มหนังสือใหม่ (Admin)[cite: 1]
 @app.route('/admin/book/add', methods=['POST'])
 def add_book():
     if session.get('role') != 'admin':
@@ -1145,7 +1719,7 @@ def add_book():
     flash(f"📚 เพิ่มหนังสือ \"{title}\" เข้าสู่ระบบเรียบร้อยแล้ว!", "success")
     return redirect(url_for('admin_dashboard'))
 
-# อัปเดตราคาและสต็อกหนังสือ
+# อัปเดตราคาและสต็อกหนังสือ[cite: 1]
 @app.route('/admin/book/update/<int:ebook_id>', methods=['POST'])
 def update_book(ebook_id):
     if session.get('role') != 'admin':
@@ -1160,7 +1734,7 @@ def update_book(ebook_id):
     flash("💾 ปรับปรุงราคาและสต็อกหนังสือสำเร็จ!", "success")
     return redirect(url_for('admin_dashboard'))
 
-# ลบหนังสือ
+# ลบหนังสือ[cite: 1]
 @app.route('/admin/book/delete/<int:ebook_id>')
 def delete_book(ebook_id):
     if session.get('role') != 'admin':
@@ -1171,7 +1745,7 @@ def delete_book(ebook_id):
     flash("🗑️ นำหนังสือออกจากหน้าร้านเรียบร้อยแล้ว", "info")
     return redirect(url_for('admin_dashboard'))
 
-# อนุมัติออเดอร์
+# อนุมัติออเดอร์[cite: 1]
 @app.route('/admin/approve/<int:order_id>')
 def approve_order(order_id):
     if session.get('role') != 'admin':
@@ -1183,7 +1757,7 @@ def approve_order(order_id):
     flash(f"✅ อนุมัติคำสั่งซื้อ #{order_id} และเปิดสิทธิ์ดาวน์โหลดให้ลูกค้าแล้ว!", "success")
     return redirect(url_for('admin_dashboard'))
 
-# ยกเลิกออเดอร์
+# ยกเลิกออเดอร์[cite: 1]
 @app.route('/admin/reject/<int:order_id>')
 def reject_order(order_id):
     if session.get('role') != 'admin':
@@ -1195,7 +1769,7 @@ def reject_order(order_id):
     flash(f"❌ ยกเลิกคำสั่งซื้อ #{order_id} เรียบร้อยแล้ว", "danger")
     return redirect(url_for('admin_dashboard'))
 
-# 8. หน้าโปรไฟล์ / ตั้งค่าผู้ใช้
+# 8. หน้าโปรไฟล์ / ตั้งค่าผู้ใช้[cite: 1]
 @app.route('/profile', methods=['GET', 'POST'])
 def profile():
     conn = get_db()
@@ -1263,7 +1837,7 @@ def profile():
     """
     return render_page("ตั้งค่าบัญชี", content, user=user, msg=msg, msg_type=msg_type)
 
-# 9. เข้าสู่ระบบ (นำค่าของสมชายออกหมด เป็นช่องว่างพร้อมกรอก)
+# 9. เข้าสู่ระบบ[cite: 1]
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
@@ -1311,17 +1885,13 @@ def login():
                     <span class="text-muted small">ยังไม่มีบัญชี?</span> 
                     <a href="/register" class="small fw-bold text-danger text-decoration-none">สมัครสมาชิกใหม่</a>
                 </div>
-                <hr>
-                <div class="small text-muted bg-light p-2 rounded">
-                    <strong>บัญชีผู้ดูแลระบบ (Admin):</strong><br>
-                    - อีเมล: <code>admin@ebook.com</code> / รหัสผ่าน: <code>admin123</code>
-                </div>
             </div>
         </div>
     </div>
     """
     return render_page("เข้าสู่ระบบ", content, error=error)
 
+# 10. สมัครสมาชิกใหม่ (กำหนดให้ default เป็น role_id = 2 หรือ customer เสมอ)
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     error = None
@@ -1336,7 +1906,7 @@ def register():
             error = "อีเมลนี้ถูกใช้งานแล้ว โปรดใช้อีเมลอื่น"
         else:
             cur = conn.cursor()
-            cur.execute("INSERT INTO users (role_id, email, password_hash, full_name) VALUES (1, ?, ?, ?)", 
+            cur.execute("INSERT INTO users (role_id, email, password_hash, full_name) VALUES (2, ?, ?, ?)", 
                         (email, password, full_name))
             conn.commit()
             
